@@ -23,11 +23,11 @@ public class RobotContainer {
   private boolean fieldRelative = true;
 
   public RobotContainer() {
-    // Register optional NamedCommands here
-    // NamedCommands.registerCommand("Example", Commands.print("Running Example"));
+    // Register NamedCommands here if needed (before building chooser)
+    // NamedCommands.registerCommand("Example", Commands.print("Hi"));
 
-    // Build & publish auto chooser
-    autoChooser = AutoBuilder.buildAutoChooser();
+    // Build auto chooser with a DEFAULT auto name that matches a .auto file
+    autoChooser = AutoBuilder.buildAutoChooser("L3 CoralScoring");
     SmartDashboard.putData("Auto Chooser", autoChooser);
 
     configureButtonBindings();
@@ -40,20 +40,16 @@ public class RobotContainer {
       drive.drive(x, y, rot, fieldRelative);
     }, drive));
 
-    // Also show field on dashboard
     SmartDashboard.putData("Field", drive.getField());
   }
 
   private void configureButtonBindings() {
-    // Hold RB for X-lock
     new JoystickButton(driver, XboxController.Button.kRightBumper.value)
         .whileTrue(new RunCommand(drive::setX, drive));
 
-    // Press Y to toggle field-relative on/off
     new JoystickButton(driver, XboxController.Button.kY.value)
         .onTrue(new RunCommand(() -> fieldRelative = !fieldRelative).ignoringDisable(true));
 
-    // Press Start to zero heading
     new JoystickButton(driver, XboxController.Button.kStart.value)
         .onTrue(new RunCommand(drive::zeroHeading, drive));
   }
@@ -61,6 +57,7 @@ public class RobotContainer {
   public Command getAutonomousCommand() {
     Command chosen = autoChooser.getSelected();
     if (chosen != null) return chosen;
-    return AutoBuilder.buildAuto("L3 CoralScoring"); // fallback auto name
+    // Fallback to the default name in case chooser didn't populate
+    return AutoBuilder.buildAuto("L3 CoralScoring");
   }
 }

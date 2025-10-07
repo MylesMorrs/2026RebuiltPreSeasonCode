@@ -15,6 +15,7 @@ import edu.wpi.first.math.kinematics.SwerveModuleState;
 import edu.wpi.first.wpilibj.ADIS16470_IMU;
 import edu.wpi.first.wpilibj.ADIS16470_IMU.IMUAxis;
 import edu.wpi.first.wpilibj.DriverStation;
+import edu.wpi.first.wpilibj.RobotBase; // <-- added
 import edu.wpi.first.wpilibj.Timer;
 
 import edu.wpi.first.wpilibj.simulation.ADIS16470_IMUSim;
@@ -72,7 +73,7 @@ public class DriveSubsystem extends SubsystemBase {
   private double m_lastTime = Timer.getFPGATimestamp();
   public Field2d getField() { return m_field; }
 
-  // Cache the last commanded module states (encoders don't update in sim)
+  // Cache last commanded states so sim has “feedback”
   private SwerveModuleState[] m_lastSetStates = new SwerveModuleState[] {
       new SwerveModuleState(), new SwerveModuleState(),
       new SwerveModuleState(), new SwerveModuleState()
@@ -81,11 +82,9 @@ public class DriveSubsystem extends SubsystemBase {
   /** Creates a new DriveSubsystem. */
   public DriveSubsystem() {
     HAL.report(tResourceType.kResourceType_RobotDrive, tInstances.kRobotDriveSwerve_MaxSwerve);
-
-    // Publish Field widget (sim & real)
     SmartDashboard.putData("Field", m_field);
 
-    // Load PathPlanner RobotConfig from GUI settings (settings.json)
+    // Load PathPlanner RobotConfig safely
     RobotConfig config = null;
     try {
       config = RobotConfig.fromGUISettings();
@@ -98,19 +97,18 @@ public class DriveSubsystem extends SubsystemBase {
           "PathPlanner settings.json missing! Open PathPlanner GUI → Robot Settings → Save to src/main/deploy/pathplanner/",
           false);
     } else {
-      // Configure PathPlanner AutoBuilder
       AutoBuilder.configure(
-          this::getPose,                // Pose2d supplier
-          this::resetOdometry,          // Pose reset
-          this::getRobotRelativeSpeeds, // MUST be robot-relative ChassisSpeeds
-          (speeds, ffs) -> driveRobotRelative(speeds), // Command robot-relative speeds
+          this::getPose,
+          this::resetOdometry,
+          this::getRobotRelativeSpeeds,          // now sim-aware
+          (speeds, ffs) -> driveRobotRelative(speeds),
           new PPHolonomicDriveController(
-              new PIDConstants(5.0, 0.0, 0.0), // translation PID
-              new PIDConstants(5.0, 0.0, 0.0)  // rotation PID
+              new PIDConstants(5.0, 0.0, 0.0),
+              new PIDConstants(5.0, 0.0, 0.0)
           ),
-          config,                       // RobotConfig from GUI
+          config,
           () -> DriverStation.getAlliance().isPresent()
-              && DriverStation.getAlliance().get() == DriverStation.Alliance.Red,
+             && DriverStation.getAlliance().get() == DriverStation.Alliance.Red,
           this
       );
     }
@@ -127,17 +125,16 @@ public class DriveSubsystem extends SubsystemBase {
             m_rearRight.getPosition()
         });
 
-    // Push pose to Field view
     m_field.setRobotPose(getPose());
   }
 
   @Override
   public void simulationPeriodic() {
-    // Simple kinematic sim using last commanded states (encoders don't change in sim)
     double now = Timer.getFPGATimestamp();
     double dt = now - m_lastTime;
     m_lastTime = now;
 
+    // Use last commanded states (encoders don't change in sim)
     ChassisSpeeds speeds = DriveConstants.kDriveKinematics.toChassisSpeeds(m_lastSetStates);
 
     Pose2d pose = getPose();
@@ -153,7 +150,6 @@ public class DriveSubsystem extends SubsystemBase {
         pose.getY() + vyField * dt,
         Rotation2d.fromRadians(h.getRadians() + omega * dt));
 
-    // Keep odometry coherent with the integrated pose
     m_odometry.resetPosition(
         newPose.getRotation(),
         new SwerveModulePosition[] {
@@ -165,20 +161,21 @@ public class DriveSubsystem extends SubsystemBase {
         newPose
     );
 
-    // Update simulated gyro yaw (Z)
     m_gyroSim.setGyroAngleZ(newPose.getRotation().getDegrees());
-
-    // Update field widget
     m_field.setRobotPose(newPose);
   }
 
   /** === PathPlanner hooks === */
   private ChassisSpeeds getRobotRelativeSpeeds() {
+    // In sim, derive speeds from last commanded states so the controller “sees” motion
+    if (RobotBase.isSimulation()) {
+      return DriveConstants.kDriveKinematics.toChassisSpeeds(m_lastSetStates);
+    }
     return DriveConstants.kDriveKinematics.toChassisSpeeds(getModuleStates());
   }
 
   private void driveRobotRelative(ChassisSpeeds speeds) {
-    // Route through setModuleStates so the sim cache updates too
+    // Route through setModuleStates so cache updates
     SwerveModuleState[] states = DriveConstants.kDriveKinematics.toSwerveModuleStates(speeds);
     setModuleStates(states);
   }
@@ -213,30 +210,25 @@ public class DriveSubsystem extends SubsystemBase {
     double ySpeedDelivered = ySpeed * DriveConstants.kMaxSpeedMetersPerSecond;
     double rotDelivered    = rot    * DriveConstants.kMaxAngularSpeed;
 
-    SwerveModuleState[] swerveModuleStates = DriveConstants.kDriveKinematics.toSwerveModuleStates(
+    SwerveModuleState[] states = DriveConstants.kDriveKinematics.toSwerveModuleStates(
         fieldRelative
             ? ChassisSpeeds.fromFieldRelativeSpeeds(
                 xSpeedDelivered, ySpeedDelivered, rotDelivered,
                 Rotation2d.fromDegrees(m_gyro.getAngle(IMUAxis.kZ)))
             : new ChassisSpeeds(xSpeedDelivered, ySpeedDelivered, rotDelivered));
 
-    setModuleStates(swerveModuleStates);
+    setModuleStates(states);
   }
 
   /** X-lock */
   public void setX() {
-    m_frontLeft.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(45)));
-    m_frontRight.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(-45)));
-    m_rearLeft.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(-45)));
-    m_rearRight.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(45)));
-
-    // update cache to reflect the commanded states for sim
-    m_lastSetStates = new SwerveModuleState[] {
+    SwerveModuleState[] states = new SwerveModuleState[] {
       new SwerveModuleState(0, Rotation2d.fromDegrees(45)),
       new SwerveModuleState(0, Rotation2d.fromDegrees(-45)),
       new SwerveModuleState(0, Rotation2d.fromDegrees(-45)),
       new SwerveModuleState(0, Rotation2d.fromDegrees(45))
     };
+    setModuleStates(states);
   }
 
   /** Directly set module states */
