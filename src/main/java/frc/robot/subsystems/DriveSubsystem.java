@@ -3,6 +3,7 @@ package frc.robot.subsystems;
 import edu.wpi.first.hal.FRCNetComm.tInstances;
 import edu.wpi.first.hal.FRCNetComm.tResourceType;
 import edu.wpi.first.hal.HAL;
+
 import edu.wpi.first.math.geometry.Pose2d;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.kinematics.ChassisSpeeds;
@@ -10,10 +11,18 @@ import edu.wpi.first.math.kinematics.SwerveDriveKinematics;
 import edu.wpi.first.math.kinematics.SwerveDriveOdometry;
 import edu.wpi.first.math.kinematics.SwerveModulePosition;
 import edu.wpi.first.math.kinematics.SwerveModuleState;
+
 import edu.wpi.first.wpilibj.ADIS16470_IMU;
 import edu.wpi.first.wpilibj.ADIS16470_IMU.IMUAxis;
 import edu.wpi.first.wpilibj.DriverStation;
+import edu.wpi.first.wpilibj.Timer;
+
+import edu.wpi.first.wpilibj.simulation.ADIS16470_IMUSim;
+import edu.wpi.first.wpilibj.smartdashboard.Field2d;
+import edu.wpi.first.wpilibj.smartdashboard.SmartDashboard;
+
 import edu.wpi.first.wpilibj2.command.SubsystemBase;
+
 import frc.robot.Constants.DriveConstants;
 
 import com.pathplanner.lib.auto.AutoBuilder;
@@ -57,9 +66,18 @@ public class DriveSubsystem extends SubsystemBase {
           m_rearRight.getPosition()
       });
 
+  // ---- Simulation helpers ----
+  private final Field2d m_field = new Field2d();
+  private final ADIS16470_IMUSim m_gyroSim = new ADIS16470_IMUSim(m_gyro);
+  private double m_lastTime = Timer.getFPGATimestamp();
+  public Field2d getField() { return m_field; }
+
   /** Creates a new DriveSubsystem. */
   public DriveSubsystem() {
     HAL.report(tResourceType.kResourceType_RobotDrive, tInstances.kRobotDriveSwerve_MaxSwerve);
+
+    // Publish Field widget (works in sim and real)
+    SmartDashboard.putData("Field", m_field);
 
     RobotConfig config = null;
     try {
@@ -75,8 +93,8 @@ public class DriveSubsystem extends SubsystemBase {
         this::getRobotRelativeSpeeds, // MUST be robot-relative ChassisSpeeds
         (speeds, ffs) -> driveRobotRelative(speeds), // Command robot-relative speeds
         new PPHolonomicDriveController(
-            new PIDConstants(5.0, 0.0, 0.0), // translation PID
-            new PIDConstants(5.0, 0.0, 0.0)  // rotation PID
+            new PIDConstants(5.0, 0.0, 0.0), // translation PID (tune on carpet)
+            new PIDConstants(5.0, 0.0, 0.0)  // rotation PID (tune)
         ),
         config,                       // RobotConfig from GUI
         () -> DriverStation.getAlliance().isPresent()
@@ -95,23 +113,65 @@ public class DriveSubsystem extends SubsystemBase {
             m_rearLeft.getPosition(),
             m_rearRight.getPosition()
         });
+
+    // Push pose to Field view
+    m_field.setRobotPose(getPose());
+  }
+
+  @Override
+  public void simulationPeriodic() {
+    // Simple kinematic sim (not full physics): integrate current module states into pose
+    double now = Timer.getFPGATimestamp();
+    double dt = now - m_lastTime;
+    m_lastTime = now;
+
+    // Estimate robot-relative speeds from module states
+    ChassisSpeeds speeds = DriveConstants.kDriveKinematics.toChassisSpeeds(getModuleStates());
+
+    // Integrate pose in field coordinates
+    Pose2d pose = getPose();
+    Rotation2d h = pose.getRotation();
+    double cos = h.getCos(), sin = h.getSin();
+
+    double vxField = speeds.vxMetersPerSecond * cos - speeds.vyMetersPerSecond * sin;
+    double vyField = speeds.vxMetersPerSecond * sin + speeds.vyMetersPerSecond * cos;
+    double omega   = speeds.omegaRadiansPerSecond;
+
+    Pose2d newPose = new Pose2d(
+        pose.getX() + vxField * dt,
+        pose.getY() + vyField * dt,
+        Rotation2d.fromRadians(h.getRadians() + omega * dt));
+
+    // Keep odometry coherent with our integrated pose
+    m_odometry.resetPosition(
+        newPose.getRotation(),
+        new SwerveModulePosition[] {
+            m_frontLeft.getPosition(),
+            m_frontRight.getPosition(),
+            m_rearLeft.getPosition(),
+            m_rearRight.getPosition()
+        },
+        newPose
+    );
+
+    // Update simulated gyro yaw (Z)
+    m_gyroSim.setGyroAngleZ(newPose.getRotation().getDegrees());
+
+    // Update field widget
+    m_field.setRobotPose(newPose);
   }
 
   /** === PathPlanner hooks === */
-
-  /** Current robot-relative speeds computed from module states. */
   private ChassisSpeeds getRobotRelativeSpeeds() {
     return DriveConstants.kDriveKinematics.toChassisSpeeds(getModuleStates());
   }
 
-  /** Drive the robot using robot-relative speeds (no field transform). */
   private void driveRobotRelative(ChassisSpeeds speeds) {
     SwerveModuleState[] states = DriveConstants.kDriveKinematics.toSwerveModuleStates(speeds);
     SwerveDriveKinematics.desaturateWheelSpeeds(states, DriveConstants.kMaxSpeedMetersPerSecond);
     setModuleStates(states);
   }
 
-  /** Helper: current module states from each MAXSwerveModule. */
   private SwerveModuleState[] getModuleStates() {
     return new SwerveModuleState[] {
         m_frontLeft.getState(),
@@ -122,9 +182,7 @@ public class DriveSubsystem extends SubsystemBase {
   }
 
   /** Pose getters/setters */
-  public Pose2d getPose() {
-    return m_odometry.getPoseMeters();
-  }
+  public Pose2d getPose() { return m_odometry.getPoseMeters(); }
 
   public void resetOdometry(Pose2d pose) {
     m_odometry.resetPosition(
@@ -138,11 +196,11 @@ public class DriveSubsystem extends SubsystemBase {
         pose);
   }
 
-  /** Teleop drive (kept as-is; field-relative option) */
+  /** Teleop drive (field-relative optional) */
   public void drive(double xSpeed, double ySpeed, double rot, boolean fieldRelative) {
     double xSpeedDelivered = xSpeed * DriveConstants.kMaxSpeedMetersPerSecond;
     double ySpeedDelivered = ySpeed * DriveConstants.kMaxSpeedMetersPerSecond;
-    double rotDelivered = rot * DriveConstants.kMaxAngularSpeed;
+    double rotDelivered    = rot    * DriveConstants.kMaxAngularSpeed;
 
     var swerveModuleStates = DriveConstants.kDriveKinematics.toSwerveModuleStates(
         fieldRelative
@@ -150,6 +208,7 @@ public class DriveSubsystem extends SubsystemBase {
                 xSpeedDelivered, ySpeedDelivered, rotDelivered,
                 Rotation2d.fromDegrees(m_gyro.getAngle(IMUAxis.kZ)))
             : new ChassisSpeeds(xSpeedDelivered, ySpeedDelivered, rotDelivered));
+
     SwerveDriveKinematics.desaturateWheelSpeeds(
         swerveModuleStates, DriveConstants.kMaxSpeedMetersPerSecond);
 
