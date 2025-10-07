@@ -72,13 +72,20 @@ public class DriveSubsystem extends SubsystemBase {
   private double m_lastTime = Timer.getFPGATimestamp();
   public Field2d getField() { return m_field; }
 
+  // Cache the last commanded module states (encoders don't update in sim)
+  private SwerveModuleState[] m_lastSetStates = new SwerveModuleState[] {
+      new SwerveModuleState(), new SwerveModuleState(),
+      new SwerveModuleState(), new SwerveModuleState()
+  };
+
   /** Creates a new DriveSubsystem. */
   public DriveSubsystem() {
     HAL.report(tResourceType.kResourceType_RobotDrive, tInstances.kRobotDriveSwerve_MaxSwerve);
 
-    // Publish Field widget (works in sim and real)
+    // Publish Field widget (sim & real)
     SmartDashboard.putData("Field", m_field);
 
+    // Load PathPlanner RobotConfig from GUI settings (settings.json)
     RobotConfig config = null;
     try {
       config = RobotConfig.fromGUISettings();
@@ -86,21 +93,27 @@ public class DriveSubsystem extends SubsystemBase {
       e.printStackTrace();
     }
 
-    // Configure PathPlanner AutoBuilder
-    AutoBuilder.configure(
-        this::getPose,                // Pose2d supplier
-        this::resetOdometry,          // Pose reset
-        this::getRobotRelativeSpeeds, // MUST be robot-relative ChassisSpeeds
-        (speeds, ffs) -> driveRobotRelative(speeds), // Command robot-relative speeds
-        new PPHolonomicDriveController(
-            new PIDConstants(5.0, 0.0, 0.0), // translation PID (tune on carpet)
-            new PIDConstants(5.0, 0.0, 0.0)  // rotation PID (tune)
-        ),
-        config,                       // RobotConfig from GUI
-        () -> DriverStation.getAlliance().isPresent()
-           && DriverStation.getAlliance().get() == DriverStation.Alliance.Red,
-        this
-    );
+    if (config == null) {
+      DriverStation.reportError(
+          "PathPlanner settings.json missing! Open PathPlanner GUI → Robot Settings → Save to src/main/deploy/pathplanner/",
+          false);
+    } else {
+      // Configure PathPlanner AutoBuilder
+      AutoBuilder.configure(
+          this::getPose,                // Pose2d supplier
+          this::resetOdometry,          // Pose reset
+          this::getRobotRelativeSpeeds, // MUST be robot-relative ChassisSpeeds
+          (speeds, ffs) -> driveRobotRelative(speeds), // Command robot-relative speeds
+          new PPHolonomicDriveController(
+              new PIDConstants(5.0, 0.0, 0.0), // translation PID
+              new PIDConstants(5.0, 0.0, 0.0)  // rotation PID
+          ),
+          config,                       // RobotConfig from GUI
+          () -> DriverStation.getAlliance().isPresent()
+              && DriverStation.getAlliance().get() == DriverStation.Alliance.Red,
+          this
+      );
+    }
   }
 
   @Override
@@ -120,15 +133,13 @@ public class DriveSubsystem extends SubsystemBase {
 
   @Override
   public void simulationPeriodic() {
-    // Simple kinematic sim (not full physics): integrate current module states into pose
+    // Simple kinematic sim using last commanded states (encoders don't change in sim)
     double now = Timer.getFPGATimestamp();
     double dt = now - m_lastTime;
     m_lastTime = now;
 
-    // Estimate robot-relative speeds from module states
-    ChassisSpeeds speeds = DriveConstants.kDriveKinematics.toChassisSpeeds(getModuleStates());
+    ChassisSpeeds speeds = DriveConstants.kDriveKinematics.toChassisSpeeds(m_lastSetStates);
 
-    // Integrate pose in field coordinates
     Pose2d pose = getPose();
     Rotation2d h = pose.getRotation();
     double cos = h.getCos(), sin = h.getSin();
@@ -142,7 +153,7 @@ public class DriveSubsystem extends SubsystemBase {
         pose.getY() + vyField * dt,
         Rotation2d.fromRadians(h.getRadians() + omega * dt));
 
-    // Keep odometry coherent with our integrated pose
+    // Keep odometry coherent with the integrated pose
     m_odometry.resetPosition(
         newPose.getRotation(),
         new SwerveModulePosition[] {
@@ -167,8 +178,8 @@ public class DriveSubsystem extends SubsystemBase {
   }
 
   private void driveRobotRelative(ChassisSpeeds speeds) {
+    // Route through setModuleStates so the sim cache updates too
     SwerveModuleState[] states = DriveConstants.kDriveKinematics.toSwerveModuleStates(speeds);
-    SwerveDriveKinematics.desaturateWheelSpeeds(states, DriveConstants.kMaxSpeedMetersPerSecond);
     setModuleStates(states);
   }
 
@@ -202,20 +213,14 @@ public class DriveSubsystem extends SubsystemBase {
     double ySpeedDelivered = ySpeed * DriveConstants.kMaxSpeedMetersPerSecond;
     double rotDelivered    = rot    * DriveConstants.kMaxAngularSpeed;
 
-    var swerveModuleStates = DriveConstants.kDriveKinematics.toSwerveModuleStates(
+    SwerveModuleState[] swerveModuleStates = DriveConstants.kDriveKinematics.toSwerveModuleStates(
         fieldRelative
             ? ChassisSpeeds.fromFieldRelativeSpeeds(
                 xSpeedDelivered, ySpeedDelivered, rotDelivered,
                 Rotation2d.fromDegrees(m_gyro.getAngle(IMUAxis.kZ)))
             : new ChassisSpeeds(xSpeedDelivered, ySpeedDelivered, rotDelivered));
 
-    SwerveDriveKinematics.desaturateWheelSpeeds(
-        swerveModuleStates, DriveConstants.kMaxSpeedMetersPerSecond);
-
-    m_frontLeft.setDesiredState(swerveModuleStates[0]);
-    m_frontRight.setDesiredState(swerveModuleStates[1]);
-    m_rearLeft.setDesiredState(swerveModuleStates[2]);
-    m_rearRight.setDesiredState(swerveModuleStates[3]);
+    setModuleStates(swerveModuleStates);
   }
 
   /** X-lock */
@@ -224,16 +229,30 @@ public class DriveSubsystem extends SubsystemBase {
     m_frontRight.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(-45)));
     m_rearLeft.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(-45)));
     m_rearRight.setDesiredState(new SwerveModuleState(0, Rotation2d.fromDegrees(45)));
+
+    // update cache to reflect the commanded states for sim
+    m_lastSetStates = new SwerveModuleState[] {
+      new SwerveModuleState(0, Rotation2d.fromDegrees(45)),
+      new SwerveModuleState(0, Rotation2d.fromDegrees(-45)),
+      new SwerveModuleState(0, Rotation2d.fromDegrees(-45)),
+      new SwerveModuleState(0, Rotation2d.fromDegrees(45))
+    };
   }
 
   /** Directly set module states */
   public void setModuleStates(SwerveModuleState[] desiredStates) {
     SwerveDriveKinematics.desaturateWheelSpeeds(
         desiredStates, DriveConstants.kMaxSpeedMetersPerSecond);
+
     m_frontLeft.setDesiredState(desiredStates[0]);
     m_frontRight.setDesiredState(desiredStates[1]);
     m_rearLeft.setDesiredState(desiredStates[2]);
     m_rearRight.setDesiredState(desiredStates[3]);
+
+    // Cache for simulation integration
+    m_lastSetStates = new SwerveModuleState[] {
+        desiredStates[0], desiredStates[1], desiredStates[2], desiredStates[3]
+    };
   }
 
   public void resetEncoders() {
